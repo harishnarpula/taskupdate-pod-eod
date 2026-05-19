@@ -1,0 +1,251 @@
+import { Telegraf } from "telegraf";
+import dotenv from "dotenv";
+import fs from "fs";
+import path from "path";
+
+import { planVideo } from "../ai/planner.js";
+import { generateScript } from "../ai/scriptGenerator.js";
+import { generateVoice } from "../voice/generateVoice.js";
+import { generateImages } from "../images/generateImages.js";
+import { buildVideo } from "../video/videoBuilder.js";
+import { createWorkflow } from "../utils/workflow.js";
+import { normalizeText } from "../ai/textNormalizer.js";
+import { submitPOD, submitEOD } from "../api/podEodApi.js";
+import { startScheduler } from "../scheduler/scheduler.js";
+import {
+    getSession,
+    setMode,
+    setPendingText,
+    clearSession,
+} from "../session/sessionState.js";
+
+dotenv.config();
+
+const token = process.env.TELEGRAM_BOT_TOKEN;
+
+if (!token) {
+    throw new Error("Telegram bot token missing");
+}
+
+const bot = new Telegraf(token);
+
+bot.start(async (ctx) => {
+    return ctx.reply("🚀 AI Content Engine Started");
+});
+
+bot.command("pod", async (ctx) => {
+    const chatId = ctx.chat.id;
+    setMode(chatId, "pod");
+    await ctx.reply("📋 POD mode activated!\n\nPlease type your plan for today 👇");
+});
+
+bot.command("eod", async (ctx) => {
+    const chatId = ctx.chat.id;
+    setMode(chatId, "eod");
+    await ctx.reply("📝 EOD mode activated!\n\nPlease type your end of day summary 👇");
+});
+
+// APPROVAL BUTTON HANDLERS
+bot.action("approve_pod", async (ctx) => {
+    const chatId = ctx.chat!.id;
+    const session = getSession(chatId);
+
+    await ctx.answerCbQuery();
+
+    if (!session.pendingCleanedText) {
+        return ctx.reply("❌ No pending POD found.");
+    }
+
+    try {
+        await ctx.reply("⏳ Submitting your POD...");
+        await submitPOD(session.pendingCleanedText);
+        clearSession(chatId);
+        await ctx.reply("✅ POD submitted successfully!");
+    } catch (error) {
+        console.error("❌ POD API Error:", error);
+        await ctx.reply("❌ Failed to submit POD. Please try again.");
+    }
+});
+
+bot.action("reject_pod", async (ctx) => {
+    const chatId = ctx.chat!.id;
+    await ctx.answerCbQuery();
+    setMode(chatId, "pod");
+    await ctx.reply("🔄 Please re-enter your POD 👇");
+});
+
+bot.action("approve_eod", async (ctx) => {
+    const chatId = ctx.chat!.id;
+    const session = getSession(chatId);
+
+    await ctx.answerCbQuery();
+
+    if (!session.pendingCleanedText) {
+        return ctx.reply("❌ No pending EOD found.");
+    }
+
+    try {
+        await ctx.reply("⏳ Submitting your EOD...");
+        await submitEOD(session.pendingCleanedText);
+        clearSession(chatId);
+        await ctx.reply("✅ EOD submitted successfully!");
+    } catch (error) {
+        console.error("❌ EOD API Error:", error);
+        await ctx.reply("❌ Failed to submit EOD. Please try again.");
+    }
+});
+
+bot.action("reject_eod", async (ctx) => {
+    const chatId = ctx.chat!.id;
+    await ctx.answerCbQuery();
+    setMode(chatId, "eod");
+    await ctx.reply("🔄 Please re-enter your EOD 👇");
+});
+
+// TEXT MESSAGE HANDLER
+bot.on("text", async (ctx) => {
+    const chatId = ctx.chat.id;
+    const text = ctx.message.text;
+    const session = getSession(chatId);
+
+    console.log("📩 User Message:", text, "| Mode:", session.mode);
+
+    // POD FLOW
+    if (session.mode === "pod") {
+        setMode(chatId, null);
+        await ctx.reply("🔍 Checking and normalizing your POD...");
+
+        try {
+            const cleanedText = await normalizeText(text);
+            setPendingText(chatId, cleanedText);
+
+            await ctx.reply(
+                `📋 *Your cleaned POD:*\n\n${cleanedText}\n\nDo you approve?`,
+                {
+                    parse_mode: "Markdown",
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: "✅ Approve", callback_data: "approve_pod" },
+                                { text: "❌ Reject", callback_data: "reject_pod" },
+                            ],
+                        ],
+                    },
+                }
+            );
+        } catch (error) {
+            console.error("❌ POD Normalize Error:", error);
+            await ctx.reply("❌ Failed to process your POD. Please try again.");
+        }
+
+        return;
+    }
+
+    // EOD FLOW
+    if (session.mode === "eod") {
+        setMode(chatId, null);
+        await ctx.reply("🔍 Checking and normalizing your EOD...");
+
+        try {
+            const cleanedText = await normalizeText(text);
+            setPendingText(chatId, cleanedText);
+
+            await ctx.reply(
+                `📝 *Your cleaned EOD:*\n\n${cleanedText}\n\nDo you approve?`,
+                {
+                    parse_mode: "Markdown",
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: "✅ Approve", callback_data: "approve_eod" },
+                                { text: "❌ Reject", callback_data: "reject_eod" },
+                            ],
+                        ],
+                    },
+                }
+            );
+        } catch (error) {
+            console.error("❌ EOD Normalize Error:", error);
+            await ctx.reply("❌ Failed to process your EOD. Please try again.");
+        }
+
+        return;
+    }
+
+    // VIDEO GENERATION FLOW (disabled for now)
+    await ctx.reply("🤖 Send your POD or EOD when reminded by the scheduler.");
+});
+
+async function processReelGeneration(ctx: any, text: string) {
+    try {
+        const { workflowId, workflowDir } = createWorkflow();
+
+        console.log("🧠 Workflow:", workflowId);
+
+        // STEP 1
+        const aiPlan = await planVideo(text);
+
+        if (!aiPlan) {
+            return ctx.reply("❌ Failed to generate AI plan");
+        }
+
+        const parsedPlan = JSON.parse(aiPlan);
+
+        fs.writeFileSync(
+            path.join(workflowDir, "plan.json"),
+            JSON.stringify(parsedPlan, null, 2)
+        );
+
+        // STEP 2
+        const script = await generateScript(parsedPlan);
+
+        if (!script) {
+            return ctx.reply("❌ Failed to generate script");
+        }
+
+        const parsedScript = JSON.parse(script);
+        fs.writeFileSync(
+            path.join(workflowDir, "script.json"),
+            JSON.stringify(parsedScript, null, 2)
+        );
+
+        await ctx.reply("🎤 Generating voice...\n🖼️ Generating images...");
+
+        // STEP 3 PARALLEL
+        const [voiceFilePath, generatedImages] = await Promise.all([
+            generateVoice(parsedScript.voiceover, "voice.mp3", workflowDir),
+            generateImages(parsedScript.scenes),
+        ]);
+
+        // STEP 4 SEND AUDIO
+        if (voiceFilePath) {
+            await ctx.replyWithAudio({ source: voiceFilePath });
+        }
+
+        // STEP 5 SEND IMAGES
+        for (const imagePath of generatedImages) {
+            await ctx.replyWithPhoto({ source: imagePath });
+        }
+
+        await ctx.reply("✅ AI Reel Generated Successfully");
+        await ctx.reply("🎬 Rendering final reel...");
+
+        const videoPath = await buildVideo(generatedImages, voiceFilePath);
+        await ctx.replyWithVideo({ source: videoPath });
+    } catch (error) {
+        console.error("❌ Reel Generation Error:", error);
+        await ctx.reply("❌ Failed during reel generation");
+    }
+}
+
+// GLOBAL ERROR HANDLER
+bot.catch((err) => {
+    console.error("❌ Global Telegram Error:", err);
+});
+
+bot.launch();
+
+// START SCHEDULER
+startScheduler(bot);
+
+console.log("✅ Telegram Bot Running...");
