@@ -5,7 +5,9 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "dev": "tsx watch src/telegram/bot.ts"
+    "dev": "tsx watch src/telegram/bot.ts",
+    "build": "tsc",
+    "start": "node dist/telegram/bot.js"
   },
   "keywords": [],
   "author": "",
