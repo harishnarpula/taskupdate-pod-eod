@@ -2,6 +2,9 @@ import { Telegraf } from "telegraf";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
+import express from "express";
+import axios from "axios";
+import cron from "node-cron";
 
 import { planVideo } from "../ai/planner.js";
 import { generateScript } from "../ai/scriptGenerator.js";
@@ -247,5 +250,23 @@ bot.launch();
 
 // START SCHEDULER
 startScheduler(bot);
+
+// HEALTH CHECK SERVER
+const app = express();
+app.get("/health", (_, res) => res.json({ status: "ok" }));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Health server on port ${PORT}`));
+
+// SELF-PING every 14 min, 8 AM to 11 PM
+cron.schedule("*/14 8-22 * * *", async () => {
+    const url = process.env.RENDER_URL;
+    if (!url) return;
+    try {
+        await axios.get(`${url}/health`);
+        console.log("🏓 Self-ping OK");
+    } catch {
+        console.error("❌ Self-ping failed");
+    }
+});
 
 console.log("✅ Telegram Bot Running...");
